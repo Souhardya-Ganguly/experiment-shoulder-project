@@ -1,0 +1,53 @@
+# ================================
+# Data (DO NOT COMMIT)
+# ================================
+Preprocessed Data/
+preprocessed_data/
+*.npy
+*.npz
+*.mat
+*.h5
+*.hdf5
+
+# ================================
+# Model checkpoints / outputs
+# ================================
+checkpoints/
+weights.h5
+*.pt
+*.pth
+outputs/
+pred_*.npy
+metrics.json
+loss_curve.png
+*.png
+
+# ================================
+# Python cache / env
+# ================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+venv_tf/
+
+# ================================
+# Jupyter / IDE
+# ================================
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# ================================
+# OS junk
+# ================================
+.DS_Store
+Thumbs.db
+venv_tf/
+venv_tf/
