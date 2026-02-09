@@ -13,6 +13,8 @@ from numpy import reshape
 import scipy.io
 from matplotlib import pyplot as plt
 from pathlib import Path
+import tensorflow as tf
+
 
 DATA_DIR = Path("Preprocessed Data")
 
@@ -23,12 +25,15 @@ img_cols = 256
 
 smooth = 1.
 
-def dice_coef(y_true, y_pred):
-    y_true_f = K.flatten(y_true)
-    y_pred_f = K.flatten(y_pred)
-    intersection = K.sum(y_true_f * y_pred_f)
-    return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+def dice_coef(y_true, y_pred, smooth=1e-6):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
 
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    return (2.0 * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
 
 def dice_coef_loss(y_true, y_pred):
     return -dice_coef(y_true, y_pred)
@@ -76,7 +81,10 @@ def get_unet():
     model = Model(inputs=[inputs], outputs=[conv10])
 
     #model.compile(optimizer=Adam(lr=1e-5), loss='mse')
-    model.compile(optimizer=Adam(lr=1e-5), loss=dice_coef_loss, metrics=[dice_coef])
+    model.compile(optimizer=Adam(learning_rate=1e-5),
+                loss=dice_coef_loss,
+                metrics=[dice_coef])
+
 
     return model
 

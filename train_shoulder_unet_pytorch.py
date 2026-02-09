@@ -27,7 +27,7 @@ class CFG:
     test_h_msk: str = "data_mask_test_h_full.npy"
 
     # Training defaults (tune later)
-    epochs: int = 50
+    epochs: int = 300
     batch_size: int = 16
     lr: float = 1e-3
     weight_decay: float = 1e-4
