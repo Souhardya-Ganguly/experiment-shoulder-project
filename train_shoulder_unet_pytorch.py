@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Tuple, Dict
@@ -7,9 +8,8 @@ from typing import Tuple, Dict
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
 
 
 # ----------------------------
@@ -26,13 +26,24 @@ class CFG:
     test_h_img: str = "data_test_h_full.npy"
     test_h_msk: str = "data_mask_test_h_full.npy"
 
-    # Training defaults (tune later)
+    # Training defaults
     epochs: int = 300
     batch_size: int = 16
     lr: float = 1e-3
     weight_decay: float = 1e-4
     num_workers: int = 4
     seed: int = 42
+
+    # Experiment / Aug
+    exp_name: str = "e0"          # e0 | e1 | e2
+    aug_profile: str = "none"     # none | classical
+    deterministic: bool = False
+
+    # E2 placeholder (diffusion) – not used yet
+    use_synth: bool = False
+    p_synth: float = 0.10
+    synth_img: str = ""
+    synth_msk: str = ""
 
     # Model / data
     in_ch: int = 1
@@ -42,29 +53,92 @@ class CFG:
     # Threshold for binary metrics
     thr: float = 0.5
 
-    # Output
+    # Output (will be overridden per experiment)
     out_dir: Path = Path("outputs")
     ckpt_dir: Path = Path("checkpoints")
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ----------------------------
+# CLI
+# ----------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--exp", type=str, default="e0", choices=["e0", "e1", "e2"])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--deterministic", action="store_true")
+    return p.parse_args()
+
+
+# ----------------------------
 # Utils
 # ----------------------------
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = False) -> None:
     import random
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # Best-effort determinism (may reduce speed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+
+    # For controlled ablations: prefer deterministic=True
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = not bool(deterministic)
 
 
 def ensure_dirs(cfg: CFG) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     cfg.ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _rand_uniform(rng: np.random.Generator, a: float, b: float) -> float:
+    return float(rng.random() * (b - a) + a)
+
+
+def apply_classical_aug(x: np.ndarray, y: np.ndarray, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    x: (H,W) float32 in [0,1]
+    y: (H,W) float32 in {0,1}
+    Returns augmented (x,y) with geometry preserved exactly (no interpolation).
+    Suitable for ultrasound-like data.
+    """
+    # --- spatial (safe, no interpolation) ---
+    if rng.random() < 0.5:
+        x = np.fliplr(x)
+        y = np.fliplr(y)
+    if rng.random() < 0.2:   # vertical flips less common in US, keep lower
+        x = np.flipud(x)
+        y = np.flipud(y)
+
+    # random 90-degree rotations
+    k = int(rng.integers(0, 4))
+    if k:
+        x = np.rot90(x, k)
+        y = np.rot90(y, k)
+
+    # --- intensity (image only) ---
+    # gamma jitter (mild)
+    gamma = _rand_uniform(rng, 0.85, 1.15)
+    x = np.clip(x, 0.0, 1.0) ** gamma
+
+    # contrast + brightness
+    contrast = _rand_uniform(rng, 0.9, 1.1)
+    brightness = _rand_uniform(rng, -0.05, 0.05)
+    x = np.clip((x - 0.5) * contrast + 0.5 + brightness, 0.0, 1.0)
+
+    # additive Gaussian noise
+    if rng.random() < 0.5:
+        sigma = _rand_uniform(rng, 0.0, 0.03)
+        x = np.clip(x + rng.normal(0.0, sigma, size=x.shape).astype(np.float32), 0.0, 1.0)
+
+    # multiplicative "speckle" (mild)
+    if rng.random() < 0.4:
+        speckle = _rand_uniform(rng, 0.0, 0.06)
+        x = np.clip(x * (1.0 + rng.normal(0.0, speckle, size=x.shape).astype(np.float32)), 0.0, 1.0)
+
+    return x.astype(np.float32), y.astype(np.float32)
 
 
 # ----------------------------
@@ -79,25 +153,33 @@ class NPYSegDataset(Dataset):
       x: torch.float32 (1, H, W)
       y: torch.float32 (1, H, W)
     """
-    def __init__(self, x_path: Path, y_path: Path):
+    def __init__(self, x_path: Path, y_path: Path, *, is_train: bool, aug_profile: str, seed: int):
         self.X = np.load(x_path, mmap_mode="r")
         self.Y = np.load(y_path, mmap_mode="r")
 
         if self.X.shape[0] != self.Y.shape[0]:
             raise ValueError(f"Misaligned N: X={self.X.shape}, Y={self.Y.shape}")
-
         if self.X.ndim != 3 or self.Y.ndim != 3:
-            raise ValueError(f"Expected (N,H,W) arrays. Got X.ndim={self.X.ndim}, Y.ndim={self.Y.ndim}")
+            raise ValueError(f"Expected (N,H,W). Got X.ndim={self.X.ndim}, Y.ndim={self.Y.ndim}")
 
-        # Basic sanity prints once
+        self.is_train = bool(is_train)
+        self.aug_profile = str(aug_profile)
+        self.seed = int(seed)
+
         self._printed = False
 
     def __len__(self) -> int:
         return self.X.shape[0]
 
     def __getitem__(self, idx: int):
-        x = self.X[idx].astype(np.float32)   # float64 -> float32
-        y = self.Y[idx].astype(np.float32)   # bool -> float32
+        x = self.X[idx].astype(np.float32)
+        y = self.Y[idx].astype(np.float32)
+
+        # Per-sample RNG: reproducible across runs, independent of dataloader shuffling
+        rng = np.random.default_rng(self.seed * 1_000_003 + idx)
+
+        if self.is_train and self.aug_profile == "classical":
+            x, y = apply_classical_aug(x, y, rng)
 
         # Add channel dim: (H,W)->(1,H,W)
         x = np.expand_dims(x, axis=0)
@@ -105,6 +187,7 @@ class NPYSegDataset(Dataset):
 
         if not self._printed and idx == 0:
             self._printed = True
+            print(f"[Dataset] aug_profile={self.aug_profile} is_train={self.is_train}")
             print(f"[Dataset] X: shape={self.X.shape}, dtype={self.X.dtype}, min={float(np.min(self.X))}, max={float(np.max(self.X))}")
             print(f"[Dataset] Y: shape={self.Y.shape}, dtype={self.Y.dtype}, unique(sample0)={np.unique(self.Y[0])[:10]}")
             print(f"[Dataset] Returned tensors: x={x.shape} float32, y={y.shape} float32")
@@ -187,10 +270,6 @@ class UNet(nn.Module):
 # Losses & Metrics
 # ----------------------------
 def soft_dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-    """
-    logits: (B,1,H,W)
-    targets: (B,1,H,W) float in {0,1}
-    """
     probs = torch.sigmoid(logits)
     num = 2.0 * torch.sum(probs * targets, dim=(1, 2, 3)) + eps
     den = torch.sum(probs + targets, dim=(1, 2, 3)) + eps
@@ -200,9 +279,6 @@ def soft_dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps:
 
 @torch.no_grad()
 def dice_iou_from_logits(logits: torch.Tensor, targets: torch.Tensor, thr: float = 0.5, eps: float = 1e-7) -> Tuple[float, float]:
-    """
-    Computes batch-aggregated Dice and IoU on binary masks.
-    """
     probs = torch.sigmoid(logits)
     preds = (probs >= thr).to(torch.uint8)
     t = (targets >= 0.5).to(torch.uint8)
@@ -284,18 +360,13 @@ def eval_model(model, loader, device, thr: float) -> Dict[str, float]:
 
 @torch.no_grad()
 def predict_full(model, loader, device) -> np.ndarray:
-    """
-    Returns probabilities (sigmoid output) as numpy array of shape (N, H, W).
-    """
     model.eval()
     preds = []
-
     for x, _ in loader:
         x = x.to(device, non_blocking=True)
         logits = model(x)
         probs = torch.sigmoid(logits).squeeze(1)  # (B,H,W)
         preds.append(probs.detach().cpu().numpy().astype(np.float32))
-
     return np.concatenate(preds, axis=0)
 
 
@@ -303,12 +374,39 @@ def predict_full(model, loader, device) -> np.ndarray:
 # Main
 # ----------------------------
 def main():
+    args = parse_args()
     cfg = CFG()
+
+    cfg.exp_name = args.exp
+    cfg.seed = args.seed
+    cfg.deterministic = bool(args.deterministic)
+
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.lr is not None:
+        cfg.lr = args.lr
+
+    # Map exp -> augmentation
+    if cfg.exp_name == "e0":
+        cfg.aug_profile = "none"
+    elif cfg.exp_name == "e1":
+        cfg.aug_profile = "classical"
+    elif cfg.exp_name == "e2":
+        # placeholder: behave like e1 until we add diffusion samples
+        cfg.aug_profile = "classical"
+        cfg.use_synth = False
+
+    # Per-experiment output dirs (prevents overwriting)
+    cfg.out_dir = Path("outputs") / cfg.exp_name
+    cfg.ckpt_dir = Path("checkpoints") / cfg.exp_name
+
     ensure_dirs(cfg)
-    set_seed(cfg.seed)
+    set_seed(cfg.seed, deterministic=cfg.deterministic)
 
     device = cfg.device
-    print(f"[Info] device={device}")
+    print(f"[Info] device={device} exp={cfg.exp_name} aug={cfg.aug_profile} deterministic={cfg.deterministic}")
 
     # Paths
     train_x = cfg.data_dir / cfg.train_img
@@ -323,7 +421,7 @@ def main():
             raise FileNotFoundError(f"Missing file: {p.resolve()}")
 
     # Datasets / loaders
-    ds_train = NPYSegDataset(train_x, train_y)
+    ds_train = NPYSegDataset(train_x, train_y, is_train=True, aug_profile=cfg.aug_profile, seed=cfg.seed)
     dl_train = DataLoader(
         ds_train,
         batch_size=cfg.batch_size,
@@ -333,7 +431,7 @@ def main():
         drop_last=False,
     )
 
-    ds_testb = NPYSegDataset(testb_x, testb_y)
+    ds_testb = NPYSegDataset(testb_x, testb_y, is_train=False, aug_profile="none", seed=cfg.seed)
     dl_testb = DataLoader(
         ds_testb,
         batch_size=cfg.batch_size,
@@ -343,7 +441,7 @@ def main():
         drop_last=False,
     )
 
-    ds_testh = NPYSegDataset(testh_x, testh_y)
+    ds_testh = NPYSegDataset(testh_x, testh_y, is_train=False, aug_profile="none", seed=cfg.seed)
     dl_testh = DataLoader(
         ds_testh,
         batch_size=cfg.batch_size,
@@ -362,7 +460,15 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda"))
 
     best_score = -1.0
-    history = {"train_loss": [], "testb_loss": [], "testb_dice": [], "testb_iou": [], "testh_loss": [], "testh_dice": [], "testh_iou": []}
+    history = {
+        "train_loss": [],
+        "testb_loss": [],
+        "testb_dice": [],
+        "testb_iou": [],
+        "testh_loss": [],
+        "testh_dice": [],
+        "testh_iou": [],
+    }
 
     print(f"[Info] epochs={cfg.epochs}, batch_size={cfg.batch_size}, lr={cfg.lr}")
 
@@ -380,7 +486,7 @@ def main():
         history["testh_dice"].append(metrics_h["dice"])
         history["testh_iou"].append(metrics_h["iou"])
 
-        # Select best by test/b dice (reasonable for baseline)
+        # Select best by test/b dice (kept consistent with your original script)
         score = metrics_b["dice"]
         if score > best_score:
             best_score = score
@@ -422,6 +528,8 @@ def main():
     final_h = eval_model(model, dl_testh, device, thr=cfg.thr)
 
     results = {
+        "experiment": cfg.exp_name,
+        "aug_profile": cfg.aug_profile,
         "final_test_b": final_b,
         "final_test_h": final_h,
         "best_epoch": int(ckpt["epoch"]),
@@ -431,6 +539,8 @@ def main():
         "batch_size": cfg.batch_size,
         "lr": cfg.lr,
         "weight_decay": cfg.weight_decay,
+        "seed": cfg.seed,
+        "deterministic": cfg.deterministic,
     }
 
     with open(cfg.out_dir / "metrics.json", "w", encoding="utf-8") as f:
@@ -443,11 +553,13 @@ def main():
     plt.plot(history["testh_loss"], label="test_h_loss")
     plt.xlabel("epoch")
     plt.ylabel("loss")
-    plt.title("Training / Test Loss")
+    plt.title(f"Training / Test Loss ({cfg.exp_name}, aug={cfg.aug_profile})")
     plt.legend()
     plt.tight_layout()
     plt.savefig(cfg.out_dir / "loss_curve.png", dpi=300)
-    plt.show()
+
+    # If you're on a headless server, plt.show() can hang; keep it off by default.
+    # plt.show()
 
     print("[Done] Saved predictions + metrics:")
     print(f"  - {cfg.out_dir / 'pred_test_b.npy'}")

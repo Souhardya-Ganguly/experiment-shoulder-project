@@ -1,0 +1,19 @@
+python train_shoulder_unet_pytorch.py --exp e0 --seed 42
+python train_shoulder_unet_pytorch.py --exp e1 --seed 42
+
+
+python train_shoulder_unet_pytorch.py --exp e0 --seed 42 --deterministic
+python train_shoulder_unet_pytorch.py --exp e1 --seed 42 --deterministic
+
+Sanity check:-
+python train_shoulder_unet_pytorch.py --exp e0 --epochs 5
+python train_shoulder_unet_pytorch.py --exp e1 --epochs 5
+
+
+After both runs complete, compare:-
+cat outputs/e0/metrics.json
+cat outputs/e1/metrics.json
+
+Also compare:
+outputs/e0/loss_curve.png
+outputs/e1/loss_curve.png
