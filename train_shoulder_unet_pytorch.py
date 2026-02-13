@@ -70,6 +70,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--deterministic", action="store_true")
+    p.add_argument("--p_synth", type=float, default=0.10)
+    p.add_argument("--synth_img", type=str, default="")
+    p.add_argument("--synth_msk", type=str, default="")
+    p.add_argument("--arch", type=str, default="unet_small",
+               choices=["unet_small", "smp_unet_r34", "smp_unetpp_r34", "smp_deeplabv3p_r34", "smp_segformer_b0"])
+
+
     return p.parse_args()
 
 
@@ -195,6 +202,73 @@ class NPYSegDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
+class NPYArraysSegDataset(Dataset):
+    """
+    Dataset backed by in-memory or memmapped arrays.
+    X: (N,H,W) float32 in [0,1]
+    Y: (N,H,W) float32 or bool in {0,1}
+    """
+    def __init__(self, X: np.ndarray, Y: np.ndarray, *, is_train: bool, aug_profile: str, seed: int, name: str = "arrays"):
+        if X.shape[0] != Y.shape[0]:
+            raise ValueError(f"[{name}] Misaligned N: X={X.shape}, Y={Y.shape}")
+        if X.ndim != 3 or Y.ndim != 3:
+            raise ValueError(f"[{name}] Expected (N,H,W). Got X.ndim={X.ndim}, Y.ndim={Y.ndim}")
+
+        self.X = X
+        self.Y = Y
+        self.is_train = bool(is_train)
+        self.aug_profile = str(aug_profile)
+        self.seed = int(seed)
+        self.name = name
+        self._printed = False
+
+    def __len__(self) -> int:
+        return self.X.shape[0]
+
+    def __getitem__(self, idx: int):
+        x = self.X[idx].astype(np.float32, copy=False)
+        y = self.Y[idx].astype(np.float32, copy=False)
+
+        rng = np.random.default_rng(self.seed * 1_000_003 + idx)
+        if self.is_train and self.aug_profile == "classical":
+            x, y = apply_classical_aug(x, y, rng)
+
+        x = np.expand_dims(x, axis=0)
+        y = np.expand_dims(y, axis=0)
+
+        if not self._printed and idx == 0:
+            self._printed = True
+            print(f"[Dataset:{self.name}] aug_profile={self.aug_profile} is_train={self.is_train} N={len(self)}")
+
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+
+class MixedSegDataset(Dataset):
+    """
+    Mix real + synthetic with probability p_synth per sample draw.
+    Length is defined as len(real) to keep epoch budgets comparable to E0.
+    """
+    def __init__(self, real_ds: Dataset, synth_ds: Dataset, p_synth: float, seed: int):
+        if not (0.0 <= p_synth <= 1.0):
+            raise ValueError("p_synth must be in [0,1]")
+        self.real_ds = real_ds
+        self.synth_ds = synth_ds
+        self.p_synth = float(p_synth)
+        self.seed = int(seed)
+
+    def __len__(self) -> int:
+        return len(self.real_ds)
+
+    def __getitem__(self, idx: int):
+        rng = np.random.default_rng(self.seed * 9_999_991 + idx)
+        if rng.random() < self.p_synth:
+            j = int(rng.integers(0, len(self.synth_ds)))
+            return self.synth_ds[j]
+        else:
+            i = idx % len(self.real_ds)
+            return self.real_ds[i]
+
+
 # ----------------------------
 # Model: UNet (small, solid baseline)
 # ----------------------------
@@ -264,6 +338,51 @@ class UNet(nn.Module):
 
         logits = self.outc(d1)
         return logits
+
+
+# ----------------------------
+# Model Factory
+# ----------------------------
+def build_model(arch: str, in_ch: int, out_ch: int):
+    if arch == "unet_small":
+        return UNet(in_ch=in_ch, out_ch=out_ch, base=32)
+
+    import segmentation_models_pytorch as smp
+
+    if arch == "smp_unet_r34":
+        return smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            in_channels=in_ch,
+            classes=out_ch,
+        )
+
+    if arch == "smp_unetpp_r34":
+        return smp.UnetPlusPlus(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            in_channels=in_ch,
+            classes=out_ch,
+        )
+
+    if arch == "smp_deeplabv3p_r34":
+        return smp.DeepLabV3Plus(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            in_channels=in_ch,
+            classes=out_ch,
+        )
+
+    if arch == "smp_segformer_b0":
+        # SegFormer supported via smp with timm encoders
+        return smp.Unet(
+            encoder_name="mit_b0",
+            encoder_weights="imagenet",
+            in_channels=in_ch,
+            classes=out_ch,
+        )
+
+    raise ValueError(f"Unknown arch: {arch}")
 
 
 # ----------------------------
@@ -380,6 +499,13 @@ def main():
     cfg.exp_name = args.exp
     cfg.seed = args.seed
     cfg.deterministic = bool(args.deterministic)
+    cfg.p_synth = args.p_synth
+    if not (0.0 <= cfg.p_synth <= 1.0):
+        raise ValueError(f"--p_synth must be in [0,1], got {cfg.p_synth}")
+
+    cfg.synth_img = args.synth_img
+    cfg.synth_msk = args.synth_msk
+
 
     if args.epochs is not None:
         cfg.epochs = args.epochs
@@ -395,18 +521,24 @@ def main():
         cfg.aug_profile = "classical"
     elif cfg.exp_name == "e2":
         # placeholder: behave like e1 until we add diffusion samples
-        cfg.aug_profile = "classical"
-        cfg.use_synth = False
+        cfg.aug_profile = "none"
+        cfg.use_synth = True
 
     # Per-experiment output dirs (prevents overwriting)
-    cfg.out_dir = Path("outputs") / cfg.exp_name
-    cfg.ckpt_dir = Path("checkpoints") / cfg.exp_name
+    # Per-experiment + per-architecture + per-seed output dirs (prevents overwriting)
+    arch_tag = args.arch
+    seed_tag = f"seed{cfg.seed}"
+
+    cfg.out_dir = Path("outputs") / cfg.exp_name / arch_tag / seed_tag
+    cfg.ckpt_dir = Path("checkpoints") / cfg.exp_name / arch_tag / seed_tag
+
 
     ensure_dirs(cfg)
     set_seed(cfg.seed, deterministic=cfg.deterministic)
 
     device = cfg.device
-    print(f"[Info] device={device} exp={cfg.exp_name} aug={cfg.aug_profile} deterministic={cfg.deterministic}")
+    print(f"[Info] device={device} exp={cfg.exp_name} arch={args.arch} aug={cfg.aug_profile} deterministic={cfg.deterministic}")
+
 
     # Paths
     train_x = cfg.data_dir / cfg.train_img
@@ -421,7 +553,27 @@ def main():
             raise FileNotFoundError(f"Missing file: {p.resolve()}")
 
     # Datasets / loaders
-    ds_train = NPYSegDataset(train_x, train_y, is_train=True, aug_profile=cfg.aug_profile, seed=cfg.seed)
+    ds_train_real = NPYSegDataset(train_x, train_y, is_train=True, aug_profile=cfg.aug_profile, seed=cfg.seed)
+
+    if cfg.exp_name != "e2":
+        ds_train = ds_train_real
+    else:
+        if not cfg.synth_img or not cfg.synth_msk:
+            raise ValueError("E2 requires --synth_img and --synth_msk")
+
+        synth_x_path = Path(cfg.synth_img)
+        synth_y_path = Path(cfg.synth_msk)
+        if not synth_x_path.exists() or not synth_y_path.exists():
+            raise FileNotFoundError(f"Missing synth files: {synth_x_path} / {synth_y_path}")
+
+        Xs = np.load(synth_x_path, mmap_mode="r")
+        Ys = np.load(synth_y_path, mmap_mode="r")
+
+        ds_train_synth = NPYArraysSegDataset(Xs, Ys, is_train=True, aug_profile="none", seed=cfg.seed, name="synth")
+        ds_train = MixedSegDataset(ds_train_real, ds_train_synth, p_synth=cfg.p_synth, seed=cfg.seed)
+
+        print(f"[Info] E2 mixing: p_synth={cfg.p_synth:.2f} | N_real={len(ds_train_real)} | N_synth={len(ds_train_synth)}")
+
     dl_train = DataLoader(
         ds_train,
         batch_size=cfg.batch_size,
@@ -452,7 +604,10 @@ def main():
     )
 
     # Model
-    model = UNet(in_ch=cfg.in_ch, out_ch=cfg.out_ch, base=32).to(device)
+    # model = UNet(in_ch=cfg.in_ch, out_ch=cfg.out_ch, base=32).to(device)
+
+    model = build_model(args.arch, cfg.in_ch, cfg.out_ch).to(device)
+
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -541,6 +696,7 @@ def main():
         "weight_decay": cfg.weight_decay,
         "seed": cfg.seed,
         "deterministic": cfg.deterministic,
+        "arch": args.arch,
     }
 
     with open(cfg.out_dir / "metrics.json", "w", encoding="utf-8") as f:
@@ -553,7 +709,7 @@ def main():
     plt.plot(history["testh_loss"], label="test_h_loss")
     plt.xlabel("epoch")
     plt.ylabel("loss")
-    plt.title(f"Training / Test Loss ({cfg.exp_name}, aug={cfg.aug_profile})")
+    plt.title(f"Training / Test Loss ({cfg.exp_name}, arch={args.arch}, aug={cfg.aug_profile})")
     plt.legend()
     plt.tight_layout()
     plt.savefig(cfg.out_dir / "loss_curve.png", dpi=300)

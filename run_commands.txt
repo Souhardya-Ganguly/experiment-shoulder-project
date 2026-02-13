@@ -9,6 +9,16 @@ Sanity check:-
 python train_shoulder_unet_pytorch.py --exp e0 --epochs 5
 python train_shoulder_unet_pytorch.py --exp e1 --epochs 5
 
+Run after synthetic generation:-
+python train_shoulder_unet_pytorch.py \
+  --exp e2 \
+  --epochs 50 \
+  --seed 42 \
+  --p_synth 0.10 \
+  --synth_img "Preprocessed Data/data_train_b_synth_sd15_x.npy" \
+  --synth_msk "Preprocessed Data/data_mask_train_b_synth_sd15_y.npy"
+
+
 
 After both runs complete, compare:-
 cat outputs/e0/metrics.json
